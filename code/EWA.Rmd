@@ -1,0 +1,538 @@
+---
+title: "Self-tuning Experience weighted Attraction learning model applied to median action game"
+author: "GS Verhoeven, Dutch Healthcare Authority"
+output: pdf_document
+---
+
+# Summary
+
+This R-notebook aims to reproduce in R the results from  Ho, Camerer and Chong (Journal of Economic Theory, 2007). In particular, the results presented in Chapter 7 of the review by Ho, Lim and Camerer (2006) of behavioral economics applied to consumer and firm behavior.
+
+
+# Load packages
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(readODS)
+```
+
+# Read data
+
+The data was created by van Huyck et al in their 1991 paper "strategic uncertainty, equilibrium selection, and coordination failure in average opinion games". The table in Appendix B of their paper contains the data. The data was entered in Open Office Calc.
+
+In the experiments, each of the nine players chooses an action simultaneously and the median is then announced. Hence players have only histories of their own actions and the medians.
+The EWA model uses the actual strategies played by all players to update the attraction weights.
+
+There six sessions of 9 players each session for a total of 54 players.
+Each  session consists of 10 rounds.
+
+```{r, message=FALSE}
+df <- read_ods("../data/vanHuyck_median_action.ods")
+df <- data.table(df)
+setnames(df, "round", "session")
+
+mdf <- data.table(melt(df, id.vars = c("session", "subject")))
+setnames(mdf, "variable", "round")
+mdf <- mdf[, round := as.numeric(substr(round, 2,3))]
+```
+
+# Calculate table 14
+
+```{r}
+res <- mdf[, median(value), .(session, round)]
+dcast(res, session ~ round)
+```
+```{r}
+res <- mdf[, .(sd = sd(value)), .(session, round)]
+res[, asterisk := "."]
+res[sd == 0, asterisk := "*"]
+dcast(res, session ~ round, value.var = "asterisk")
+```
+This reproduces table 14 on page 45.
+
+# Recreate figure 3: Empirical Frequency
+
+The data from all six sessions are pooled.
+
+```{r}
+res <- mdf[, .(.N), .(value, round)]
+res <- merge(data.table(value = rep(1:7, 10), round = rep(1:10, each = 7)), 
+             res, by = c("value", "round"), all.x = T)
+res[is.na(res)] <- 0
+ggplot(res, aes(x = round, y = N, group = factor(value), col = factor(value))) + 
+  geom_point() + geom_line()
+```
+
+
+We now apply the self tuning EWA model to see if it can capture the overall behavior of the players.
+
+# Setup data structures
+
+```{r}
+n_players <- 9 # index i
+n_strategies <- 7 # index j
+n_rounds <- 10 # index t
+n_sessions <- 6
+
+#lambda <- 5.64 # ML best fit for Median action game (Ho et al JET 2007)
+lambda <- 11
+```
+
+# Action matrix
+
+Create and fill action matrix for a particular session.
+
+```{r}
+action <- matrix(nrow = n_players, ncol = n_rounds)
+
+for(t in 1:n_rounds){
+  action[, t] <- unname(unlist(df[session == 1, c(t+2), with = F]))
+}
+```
+
+
+# Payoffs
+
+calculate foregone payoffs of player i for strategy j in round t, GIVEN the strategies played by all other players (-i). This is the conditional payoff function.
+
+We also make a function that calculates for each player the actual payoffs for a set of strategies played by all players.
+
+The payoff functions rewards conformity, but also coordination on a high value.
+
+```{r}
+# payoffs for player i playing j, given the actions of other players
+cond_payoff <- function(i, j, actions){
+    actions[i] <- j
+    M <- median(actions)
+  payoff <- 0.1 * M - 0.05 * (M - actions)^2 + 0.6
+  return(payoff[i])
+}
+
+# calculate actual payoff for all players
+actual_payoff <- function(actions){
+  M <- median(actions)
+  payoff <- 0.1 * M - 0.05 * (M - actions)^2 + 0.6
+  return(payoff)
+}
+```
+
+Test payoffs:
+
+```{r}
+actual_payoff(action[,1])
+```
+This is correct.
+
+Calculate payoff when player 1 plays strategy 1, given the actions of all other players in round 1.
+
+```{r}
+median(c(1,action[-1,1]))
+cond_payoff(1, 1, action[,1])
+```
+This is correct (comparing with table 13).
+
+# Attention function delta
+
+The attention function serves to reinforce chosen and unchosen strategies that give better payoffs after playing round t.
+
+```{r}
+create_delta <- function(actions){
+  delta <- array(data = NA, 
+                   dim = c(n_players, n_strategies, n_rounds))
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+        act_payoff_i <- actual_payoff(actions[,t][i])
+        cond_payoff <- cond_payoff(i, j, actions[,t])
+        delta[i, j, t] <- 0
+        if(cond_payoff >= act_payoff_i) delta[i, j, t] <- 1
+      }
+    }
+  }
+  return(delta)
+}
+```
+
+Test delta.
+```{r}
+delta <- create_delta(action)
+action[,8]
+
+delta[, , 8]
+```
+In round 8, playing strategy 4 or 5 had given equal or greater payoff compared to its actual strategy (playing 3). For all other players, there exist no other strategy than strategy four that gives equal or higher payoffs.
+
+Works as expected.
+
+```{r}
+mdelta <- c()
+
+for(s in 1:n_sessions){
+  action_tst <- matrix(nrow = n_players, ncol = n_rounds)
+
+  for(t in 1:n_rounds){
+    action_tst[, t] <- unname(unlist(df[session == s, c(t+2), with = F]))
+  }
+  delta <- create_delta(action_tst)
+  mdelta[s] <- mean(delta[, , 8:10])
+}
+mean(mdelta)
+```
+
+For delta, Ho et al report a value of 0.15.
+We can reproduce this if we take the average over all delta values for the last three rounds, the out-of-sample rounds.
+
+# Change detector function phi
+
+Also called the decay rate ("forgetting"). 
+It serves to detect if other players are changing their strategy.
+
+```{r}
+# create historical frequencies normalized to 1
+create_cumulative_history <- function(action){
+  history <- array(data = NA, 
+                   dim = c(n_players, n_strategies, n_rounds))
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+        freq <- table(action[-i, 1:t])
+        # create counts for all strategies (also non-chosen ones)
+        freq <- merge(data.frame(Var1 = 1:n_strategies), 
+                      data.frame(freq), by = "Var1", all.x= T)
+        freq[is.na(freq)]<-0
+        history[i, , t]  <- freq[,2]/sum(freq[,2])
+      }
+    }
+  }
+  return(history)
+}
+
+create_recent_history <- function(action){
+  history <- array(data = NA, 
+                   dim = c(n_players, n_strategies, n_rounds))
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+        # note here we only look at strategies in round t
+        freq <- table(action[-i, t])
+        # create counts for all strategies (also non-chosen ones)
+        freq <- merge(data.frame(Var1 = 1:n_strategies), 
+                      data.frame(freq), by = "Var1", all.x= T)
+        freq[is.na(freq)]<-0
+        history[i, , t]  <- freq[,2]/sum(freq[,2])
+      }
+    }
+  }
+  return(history)
+}
+
+calculate_surprise_index <- function(cum_history, rec_history){
+  surprise <- array(data = NA, 
+                   dim = c(n_players, n_rounds))
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+        if(j == 1) {
+          surprise[i, t] = (cum_history[i, j, t] - rec_history[i, j, t])^2
+        } else {surprise[i, t] = surprise[i, t] + 
+          (cum_history[i, j, t] - rec_history[i, j, t])^2}
+      }
+    }
+  }
+  return(surprise)
+}
+
+calculate_phi <- function(action){
+  cum_history <- create_cumulative_history(action)
+  rec_history <- create_recent_history(action)
+  surprise <- calculate_surprise_index(cum_history, rec_history)
+  # map surprise to phi
+  phi <- 1 - 0.5 * surprise
+  return(phi)
+}
+```
+
+Test history functions.
+
+```{r}
+cum_history <- create_cumulative_history(action)
+
+# normalized counts of actions of players 1:8 in first round
+table(action[-9,1:3])/sum(table(action[-9,1:3]))
+
+cum_history[9, ,3]
+```
+Is correct.
+
+```{r}
+rec_history <- create_recent_history(action)
+
+table(action[-9,2])/sum(table(action[-9,2]))
+rec_history[9, , 2]
+```
+Is correct.
+
+Test surprise function.
+```{r}
+surprise <- calculate_surprise_index(cum_history, rec_history)
+
+phi <- calculate_phi(action)
+```
+
+For phi, Ho et al report an (average? final?) value of 0.85.
+
+```{r}
+mphi <- c()
+
+for(s in 1:n_sessions){
+  action_tst <- matrix(nrow = n_players, ncol = n_rounds)
+
+  for(t in 1:n_rounds){
+    action_tst[, t] <- unname(unlist(df[session == s, c(t+2), with = F]))
+  }
+  phi <- calculate_phi(action_tst)
+  mphi[s] <- mean(phi[ , 8:10])
+}
+mean(mphi)
+```
+Our phi is too large compared to the reported value.
+
+Check examples in paper:
+
+```{r}
+n_row <- dim(action)[1]
+n_col <- dim(action)[2]
+action_tst <- action
+
+for(i in 1:n_row){
+  for(j in 1:n_col)
+    action_tst[i, j] <- 4
+}
+action_tst[2:n_row, n_col] <- 1
+
+phi <- calculate_phi(action_tst)
+action_tst
+phi
+```
+
+
+# Experience weights
+
+Although not clear, we assume that the experience weight is player specific, since it needs to normalize over a set of attractions for a particular player. Since the experience weight is updated by a player specific phi value, that also works on the player's attractions, this leads us to a player specific experience weight.
+
+```{r}
+calculate_experience_weights <- function(phi) {
+  exp_weights <- array(data = NA, 
+                   dim = c(n_players, n_rounds + 1))
+  for(t in 1:(n_rounds + 1)){ # here t' = t+1
+    for(i in 1:n_players){
+      if(t == 1) exp_weights[i, t] <- 1
+      else{
+        exp_weights[i, t] <- (phi[i, t-1] * exp_weights[i, t-1]) + 1
+      }
+    }
+  }
+  return(exp_weights)
+} 
+```
+
+```{r}
+phi <- calculate_phi(action)
+exp_weights <- calculate_experience_weights(phi)
+```
+
+
+# Attraction array
+
+Create and fill attraction array.
+This holds for each player, each strategy and each round its attraction at the end of the round.
+
+We need to provide it with initial attractions. Ho et al use the CH model with t = 1.5.
+We use the result of their calculations by estimating them from Figure 4 for period 1.
+They hold for all players.
+
+```{r}
+# for each strategy
+init_attractions <- c(1, 2, 4, 5, 4, 2, 1)
+# normalize
+init_attractions <- init_attractions/sum(init_attractions)
+```
+
+An alternative is to use the distribution of strategies chosen in the first period of each session.
+
+```{r}
+ggplot(mdf[round == 1], aes(x = value)) + geom_histogram(binwidth = 0.5) + 
+  xlim(0.5, 7.5)
+```
+
+```{r}
+calc_attractions <- function(action, phi, delta, exp_weights, init_attractions){
+  # create empty attraction array
+  attraction <- array(data = NA, 
+                      dim = c(n_players, n_strategies, n_rounds))
+
+  for(i in 1:n_players){
+    attraction[i, , 1] <- init_attractions
+  }
+  for(t in 2:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+        term1 <- phi[i, t] * exp_weights[i, t] * attraction[i, j, t-1]
+        term2 <- (delta[i, j, t] + (1 - delta[i, j, t] * (j == action[i,t]))) * 
+          cond_payoff(i, j, action[,t])
+        numerator <- term1 + term2
+        denominator <- phi[i, t] * exp_weights[i, t] + 1
+        attraction[i, j, t] <- numerator/denominator
+      }
+    }
+  }
+  return(attraction)
+}
+```
+
+```{r}
+attraction <- calc_attractions(action, phi, delta, exp_weights, 
+                               init_attractions)
+
+```
+
+# Logistic stochastic response function
+
+```{r}
+calc_probabilities <- function(lambda, attraction){
+  # create empty attraction array
+  probability <- array(data = NA, 
+                      dim = c(n_players, n_strategies, n_rounds))
+  numerator <- array(data = NA, 
+                      dim = c(n_players, n_strategies, n_rounds))
+  denominator <- array(data = NA, 
+                      dim = c(n_players, n_rounds))
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+          numerator[i, j, t] <- exp(lambda * attraction[i, j, t])
+      }
+    }
+  }
+  # calculate normalization by summing all numerators
+  for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      denominator[i, t] <- 0
+      for(j in 1:n_strategies){
+          denominator[i, t] <- denominator[i, t] + numerator[i, j, t]
+      }
+    }
+  }
+  # combine numerators and denominators
+    for(t in 1:n_rounds){
+    for(i in 1:n_players){
+      for(j in 1:n_strategies){
+          probability[i, j, t] <- numerator[i, j, t]/denominator[i, t]
+      }
+    }
+  }
+  return(probability)
+}
+```
+
+Test function. Expect that probs sum to 1 for a each player in a round.
+
+```{r}
+probability <- calc_probabilities(lambda, attraction)
+sum(probability[1, , 1])
+```
+It works.
+
+# Complete program
+
+```{r}
+list_of_probs <- list()
+
+for(s in 1:n_sessions){
+  action <- matrix(nrow = n_players, ncol = n_rounds)
+  
+  for(t in 1:n_rounds){
+    action[, t] <- unname(unlist(df[session == s, c(t+2), with = F]))
+  }
+  phi <- calculate_phi(action)
+  delta <- create_delta(action)
+  
+  exp_weights <- calculate_experience_weights(phi)
+  
+  # for each strategy
+  init_attractions <- c(1, 2, 4, 5, 4, 2, 1)
+  # normalize
+  init_attractions <- init_attractions/sum(init_attractions)
+  
+  attraction <- calc_attractions(action, phi, delta, exp_weights, 
+                                 init_attractions)
+  
+  probability <- calc_probabilities(lambda, attraction)
+  list_of_probs[[s]] <- probability
+}
+```
+
+# Plot self-tuning EWA predicted frequencies
+
+For each round, and each strategy, sum all probability density over the players.
+
+```{r}
+calc_frequencies <- function(probability){
+  frequency <- array(data = NA, 
+                    dim = c(n_strategies, n_rounds))
+  for(t in 1:n_rounds){
+    for(j in 1:n_strategies){
+      frequency[j, t] <- 0
+      for(i in 1:n_players){
+        frequency[j, t] <- frequency[j, t] + probability[i, j, t]
+      }
+    }
+  }
+  return(frequency/n_players)
+}
+
+```
+
+```{r}
+frequency <- calc_frequencies(list_of_probs[[1]])
+
+for(s in 2:n_sessions){
+  frequency <- frequency + calc_frequencies(list_of_probs[[s]])
+}
+frequency <- frequency/n_sessions
+```
+
+```{r}
+mfreq <- data.table(melt(frequency))
+setnames(mfreq, "Var1", "Strategy")
+setnames(mfreq, "Var2", "Round")
+mfreq <- mfreq[, type := "model"]
+ggplot(mfreq, aes(x = Round, y = value, group = factor(Strategy), 
+                  col = factor(Strategy))) + geom_point() + geom_line()
+```
+
+Combine model with data:
+
+```{r}
+res <- mdf[, .(N = .N/(n_players*n_sessions)), .(value, round)]
+res <- merge(data.table(value = rep(1:7, 10), round = rep(1:10, each = 7)), 
+             res, by = c("value", "round"), all.x = T)
+res[is.na(res)] <- 0
+
+setnames(res, "value", "Strategy")
+setnames(res, "round", "Round")
+setnames(res, "N", "value")
+setkey(res, Round)
+
+res <- res[, type := "experiment"]
+
+res <- rbind(res, mfreq)
+
+ggplot(res[type == "model"], aes(x = Round, y = value, group = factor(Strategy),
+                                 col = factor(Strategy))) + geom_point() + 
+  geom_line() + geom_point(data = res[type == "experiment"], shape = 3) + 
+  geom_line(data = res[type == "experiment"], linetype = 2) + facet_wrap(~ Strategy)
+```
+
+
